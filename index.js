@@ -7,6 +7,7 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import os from 'os';
+import cors from 'cors';
 
 // Configure environment variables
 dotenv.config();
@@ -78,16 +79,61 @@ const logger = winston.createLogger({
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Health check endpoint
-app.get('/health', (req, res) => {
+// Enable CORS for all routes
+app.use((req, res, next) => {
+    res.header('Access-Control-Allow-Origin', '*');
+    res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept');
+    next();
+});
+
+// Simple root endpoint for basic health checks
+app.get('/', (req, res) => {
     res.status(200).json({
-        status: 'OK',
+        status: 'ok',
+        service: 'keep-alive-service',
         timestamp: new Date().toISOString(),
-        uptime: process.uptime(),
-        memory: process.memoryUsage(),
-        load: os.loadavg(),
-        env: process.env.NODE_ENV || 'development'
+        uptime: process.uptime()
     });
+});
+
+// Health check endpoint with detailed system information
+app.get('/health', (req, res) => {
+    try {
+        const memory = process.memoryUsage();
+        const memoryInMB = {};
+        
+        // Convert bytes to MB for better readability
+        Object.keys(memory).forEach(key => {
+            memoryInMB[key] = `${Math.round(memory[key] / 1024 / 1024 * 100) / 100} MB`;
+        });
+        
+        res.status(200).json({
+            status: 'OK',
+            service: 'keep-alive-service',
+            timestamp: new Date().toISOString(),
+            uptime: `${Math.floor(process.uptime() / 60)} minutes`,
+            memory: memoryInMB,
+            load: os.loadavg(),
+            platform: process.platform,
+            nodeVersion: process.version,
+            env: process.env.NODE_ENV || 'development',
+            lastRun: lastRunTime,
+            nextRun: nextRunTime,
+            stats: {
+                totalRuns,
+                successfulRuns,
+                failedRuns,
+                successRate: totalRuns > 0 ? Math.round((successfulRuns / totalRuns) * 100) : 0
+            }
+        });
+    } catch (error) {
+        logger.error('Error in health check:', error);
+        res.status(500).json({
+            status: 'ERROR',
+            error: error.message,
+            timestamp: new Date().toISOString()
+        });
+    }
 });
 
 // Simple metrics endpoint
