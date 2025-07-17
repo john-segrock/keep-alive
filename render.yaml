@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: keep-alive-service
+    runtime: node
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: NODE_VERSION
+        value: 18.x
+      - key: PORT
+        value: 10000
+      - key: API_BASE_URL
+        value: your-backend-url-here
+      - key: KEEP_ALIVE_EMAIL
+        value: your-email@example.com
+      - key: KEEP_ALIVE_PASSWORD
+        value: your-secure-password
+      - key: KEEP_ALIVE_INTERVAL
+        value: '840000'  # 14 minutes in milliseconds
+      - key: LOG_LEVEL
+        value: 'info'
+    plan: free
