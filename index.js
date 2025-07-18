@@ -171,13 +171,15 @@ process.on('SIGTERM', () => {
     });
 });
 
-// Track service metrics
+// Track service metrics and state
 let lastRunTime = null;
 let nextRunTime = null;
 let totalRuns = 0;
 let successfulRuns = 0;
 let failedRuns = 0;
 let lastError = null;
+let isLoggedIn = false; // Track login state to alternate between login/logout
+let currentCookies = null; // Store cookies for logout
 
 // Validate environment variables
 function validateEnv() {
@@ -227,32 +229,49 @@ async function keepAlive() {
             
             logger.info(`🚀 Keep-alive attempt ${attempt}/${maxAttempts}...`);
             
-            // Step 1: Login
-            logger.info('1/3: Logging in...');
-            const loginResponse = await api.post('/api/auth/login', {
-                email: process.env.KEEP_ALIVE_EMAIL,
-                password: process.env.KEEP_ALIVE_PASSWORD
-            });
-            
-            // Get cookies from the response
-            const cookies = loginResponse.headers['set-cookie'];
-            
-            // Step 2: Verify session
-            logger.info('2/3: Verifying session...');
-            const meResponse = await api.get('/api/auth/me', {
-                headers: { Cookie: cookies },
-                timeout: 10000 // 10 seconds timeout for this request
-            });
-            
-            const userEmail = meResponse.data?.email || 'N/A';
-            logger.info(`✅ Session active for: ${userEmail}`);
-            
-            // Step 3: Logout
-            logger.info('3/3: Logging out...');
-            await api.post('/api/auth/logout', {}, {
-                headers: { Cookie: cookies },
-                timeout: 5000 // 5 seconds timeout for logout
-            });
+            if (isLoggedIn) {
+                // Perform logout
+                logger.info('Performing logout...');
+                await api.post('/api/auth/logout', {}, {
+                    headers: { 
+                        'Cookie': currentCookies,
+                        'X-Requested-With': 'XMLHttpRequest'
+                    },
+                    timeout: 10000
+                });
+                logger.info('✅ Logout successful');
+                isLoggedIn = false;
+                currentCookies = null;
+            } else {
+                // Perform login and verify session
+                logger.info('Performing login...');
+                const loginResponse = await api.post('/api/auth/login', {
+                    email: process.env.KEEP_ALIVE_EMAIL,
+                    password: process.env.KEEP_ALIVE_PASSWORD
+                }, {
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'X-Requested-With': 'XMLHttpRequest'
+                    },
+                    timeout: 10000
+                });
+                
+                // Get cookies from the response
+                currentCookies = loginResponse.headers['set-cookie']?.join('; ');
+                
+                // Verify session
+                const meResponse = await api.get('/api/auth/me', {
+                    headers: { 
+                        'Cookie': currentCookies,
+                        'X-Requested-With': 'XMLHttpRequest'
+                    },
+                    timeout: 10000
+                });
+                
+                const userEmail = meResponse.data?.email || 'N/A';
+                logger.info(`✅ Login successful for: ${userEmail}`);
+                isLoggedIn = true;
+            }
             
             success = true;
             successfulRuns++;
@@ -295,34 +314,36 @@ async function main() {
         // Validate environment variables
         validateEnv();
         
-        logger.info('🚀 Starting Keep-Alive Service');
-        logger.info(`🔗 Backend URL: ${process.env.API_BASE_URL}`);
-        logger.info(`⏱️  Keep-alive interval: ${(process.env.KEEP_ALIVE_INTERVAL / 60000).toFixed(0)} minutes`);
-        logger.info(`🌐 Health check available at http://localhost:${PORT}/health`);
+        logger.info('🚀 Starting keep-alive service...');
+        logger.info(`🔧 Environment: ${process.env.NODE_ENV || 'development'}`);
+        logger.info(`🌐 Backend URL: ${process.env.API_BASE_URL}`);
         
-        // Function to run keepAlive and handle any uncaught errors
+        // Set the interval to 14 minutes (840000 ms)
+        const interval = 14 * 60 * 1000;
+        logger.info(`⏱  Keep-alive interval: ${interval / 60000} minutes`);
+        
+        // Function to run keepAlive and handle any errors
         const runKeepAlive = async () => {
             try {
                 await keepAlive();
+                successfulRuns++;
             } catch (error) {
-                logger.error('Unhandled error in keepAlive:', error);
+                failedRuns++;
+                lastError = error;
+                logger.error('Error in keep-alive:', error);
             } finally {
-                // Schedule next run
-                nextRunTime = new Date(Date.now() + (parseInt(process.env.KEEP_ALIVE_INTERVAL) || 840000));
-                logger.info(`⏭️ Next run scheduled for: ${nextRunTime.toISOString()}`);
+                lastRunTime = new Date();
+                nextRunTime = new Date(Date.now() + interval);
+                logger.info(`⏭️ Next run at: ${nextRunTime.toLocaleTimeString()}`);
             }
         };
         
-        // Initial run
+        // Initial run (will perform login on first run)
         logger.info('Running initial keep-alive check...');
         await runKeepAlive();
         
         // Set up interval for subsequent runs
-        const intervalId = setInterval(() => {
-            runKeepAlive().catch(error => {
-                logger.error('Error in scheduled keep-alive:', error);
-            });
-        }, parseInt(process.env.KEEP_ALIVE_INTERVAL) || 840000);
+        const intervalId = setInterval(runKeepAlive, interval);
         
         // Handle process termination
         const shutdown = async (signal) => {
@@ -331,23 +352,33 @@ async function main() {
             // Clear the interval
             clearInterval(intervalId);
             
+            // Try to log out if currently logged in
+            if (isLoggedIn && currentCookies) {
+                try {
+                    await api.post('/api/auth/logout', {}, {
+                        headers: { 
+                            'Cookie': currentCookies,
+                            'X-Requested-With': 'XMLHttpRequest'
+                        },
+                        timeout: 5000
+                    });
+                    logger.info('Successfully logged out before shutdown');
+                } catch (error) {
+                    logger.warn('Error during final logout:', error.message);
+                }
+            }
+            
             // Close the HTTP server
             server.close(() => {
                 logger.info('HTTP server closed.');
                 process.exit(0);
             });
-            
-            // Force exit after timeout
-            setTimeout(() => {
-                logger.warn('Forcing shutdown after timeout...');
-                process.exit(1);
-            }, 10000);
         };
-        
-        // Handle various termination signals
-        process.on('SIGINT', () => shutdown('SIGINT'));
+
+        // Set up signal handlers for graceful shutdown
         process.on('SIGTERM', () => shutdown('SIGTERM'));
-        
+        process.on('SIGINT', () => shutdown('SIGINT'));
+
         // Handle uncaught exceptions
         process.on('uncaughtException', (error) => {
             logger.error('Uncaught Exception:', error);
@@ -360,6 +391,10 @@ async function main() {
             logger.error('Unhandled Rejection at:', promise, 'reason:', reason);
             // Don't exit for unhandled rejections to keep the process running
         });
+
+        // Log startup completion
+        logger.info('✅ Service is running and ready');
+        logger.info(`🌐 Health check available at http://localhost:${PORT}/health`);
         
     } catch (error) {
         logger.error('Fatal error during service startup:', error);
