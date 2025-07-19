@@ -95,14 +95,48 @@ app.use((req, res, next) => {
     next();
 });
 
+// Request logging middleware
+app.use((req, res, next) => {
+    const start = Date.now();
+    
+    res.on('finish', () => {
+        const duration = Date.now() - start;
+        logger.info(`📡 ${req.method} ${req.originalUrl} - ${res.statusCode} (${duration}ms)`, {
+            ip: req.ip,
+            userAgent: req.headers['user-agent'],
+            statusCode: res.statusCode,
+            duration: `${duration}ms`,
+            referrer: req.headers.referer || '',
+            host: req.headers.host
+        });
+    });
+    
+    next();
+});
+
 // Simple root endpoint for basic health checks
 app.get('/', (req, res) => {
-    res.status(200).json({
+    const status = {
         status: 'ok',
         service: 'keep-alive-service',
+        uptime: process.uptime(),
         timestamp: new Date().toISOString(),
-        uptime: process.uptime()
-    });
+        environment: process.env.NODE_ENV || 'development',
+        nodeVersion: process.version,
+        memoryUsage: {
+            rss: `${(process.memoryUsage().rss / 1024 / 1024).toFixed(2)} MB`,
+            heapTotal: `${(process.memoryUsage().heapTotal / 1024 / 1024).toFixed(2)} MB`,
+            heapUsed: `${(process.memoryUsage().heapUsed / 1024 / 1024).toFixed(2)} MB`,
+        },
+        lastRun: lastRunTime?.toISOString() || 'Never',
+        nextRun: nextRunTime?.toISOString() || 'Scheduled after next restart',
+        isLoggedIn,
+        successfulRuns,
+        failedRuns,
+        totalRuns
+    };
+
+    res.status(200).json(status);
 });
 
 // Health check endpoint with detailed system information
@@ -116,25 +150,47 @@ app.get('/health', (req, res) => {
             memoryInMB[key] = `${Math.round(memory[key] / 1024 / 1024 * 100) / 100} MB`;
         });
         
-        res.status(200).json({
-            status: 'OK',
-            service: 'keep-alive-service',
+        const health = {
+            status: 'UP',
             timestamp: new Date().toISOString(),
-            uptime: `${Math.floor(process.uptime() / 60)} minutes`,
-            memory: memoryInMB,
-            load: os.loadavg(),
-            platform: process.platform,
-            nodeVersion: process.version,
-            env: process.env.NODE_ENV || 'development',
-            lastRun: lastRunTime,
-            nextRun: nextRunTime,
+            uptime: process.uptime(),
+            checks: [
+                {
+                    name: 'backend_connection',
+                    status: isLoggedIn ? 'UP' : 'DOWN',
+                    lastCheck: lastRunTime?.toISOString() || 'Never',
+                    nextCheck: nextRunTime?.toISOString() || 'Scheduled after next restart'
+                },
+                {
+                    name: 'database',
+                    status: 'N/A',
+                    message: 'No database connection required'
+                },
+                {
+                    name: 'memory_usage',
+                    status: 'OK',
+                    rss: `${(process.memoryUsage().rss / 1024 / 1024).toFixed(2)} MB`,
+                    heapTotal: `${(process.memoryUsage().heapTotal / 1024 / 1024).toFixed(2)} MB`,
+                    heapUsed: `${(process.memoryUsage().heapUsed / 1024 / 1024).toFixed(2)} MB`,
+                }
+            ],
             stats: {
-                totalRuns,
                 successfulRuns,
                 failedRuns,
-                successRate: totalRuns > 0 ? Math.round((successfulRuns / totalRuns) * 100) : 0
+                totalRuns,
+                lastError: lastError ? lastError.message : null
             }
+        };
+
+        // Log health check with more details
+        logger.info('🏥 Health check', {
+            status: health.status,
+            backendStatus: health.checks[0].status,
+            memory: health.checks[2].rss,
+            uptime: health.uptime
         });
+
+        res.status(200).json(health);
     } catch (error) {
         logger.error('Error in health check:', error);
         res.status(500).json({
@@ -155,6 +211,11 @@ app.get('/metrics', (req, res) => {
         failedRuns,
         lastError: lastError ? lastError.message : null
     });
+});
+
+// Simple ping endpoint for basic monitoring
+app.get('/ping', (req, res) => {
+    res.status(200).send('pong');
 });
 
 // Start the HTTP server
@@ -210,8 +271,8 @@ const api = axios.create({
 // Function to perform login with retry logic
 async function performLogin() {
     let attempt = 1;
-    const maxAttempts = 10; // Increased max attempts
-    const baseDelay = 5000; // 5 seconds
+    const maxAttempts = 10;
+    const baseDelay = 5000; // 5 seconds initial delay
     
     while (attempt <= maxAttempts) {
         try {
@@ -228,19 +289,8 @@ async function performLogin() {
                 timeout: 10000
             });
             
-            // Get cookies from the response
             const cookies = loginResponse.headers['set-cookie']?.join('; ');
-            
-            // Verify session
-            const meResponse = await api.get('/api/auth/me', {
-                headers: { 
-                    'Cookie': cookies,
-                    'X-Requested-With': 'XMLHttpRequest'
-                },
-                timeout: 10000
-            });
-            
-            const userEmail = meResponse.data?.email || 'N/A';
+            const userEmail = loginResponse.data?.email || 'N/A';
             logger.info(`✅ Login successful for: ${userEmail}`);
             
             return {
@@ -249,17 +299,15 @@ async function performLogin() {
             };
             
         } catch (error) {
-            const waitTime = Math.min(baseDelay * Math.pow(2, attempt - 1), 300000); // Cap at 5 minutes
-            logger.warn(`Login attempt ${attempt} failed: ${error.message}. Retrying in ${waitTime/1000} seconds...`);
+            const waitTime = Math.min(baseDelay * Math.pow(2, attempt - 1), 30000); // Cap at 30s
+            logger.warn(`Login attempt ${attempt} failed: ${error.message}`);
             
             if (attempt === maxAttempts) {
-                logger.error('Max login attempts reached. Will retry on next cycle.');
-                return {
-                    success: false,
-                    error: error.message
-                };
+                logger.error('Max login attempts reached. Will retry login cycle in 1 minute.');
+                return { success: false };
             }
             
+            // Wait before next attempt
             await new Promise(resolve => setTimeout(resolve, waitTime));
             attempt++;
         }
@@ -271,8 +319,7 @@ async function performLogin() {
 // Function to perform logout with retry logic
 async function performLogout(cookies) {
     let attempt = 1;
-    const maxAttempts = 5;
-    const baseDelay = 5000; // 5 seconds
+    const maxAttempts = 2;
     
     while (attempt <= maxAttempts) {
         try {
@@ -290,15 +337,14 @@ async function performLogout(cookies) {
             return true;
             
         } catch (error) {
-            const waitTime = Math.min(baseDelay * Math.pow(2, attempt - 1), 120000); // Cap at 2 minutes
-            logger.warn(`Logout attempt ${attempt} failed: ${error.message}. Retrying in ${waitTime/1000} seconds...`);
-            
+            logger.warn(`Logout attempt ${attempt} failed: ${error.message}`);
             if (attempt === maxAttempts) {
-                logger.error('Max logout attempts reached. Will retry on next cycle.');
+                logger.warn('Max logout attempts reached. Will proceed to login cycle.');
                 return false;
             }
             
-            await new Promise(resolve => setTimeout(resolve, waitTime));
+            // Short delay before next attempt
+            await new Promise(resolve => setTimeout(resolve, 5000));
             attempt++;
         }
     }
@@ -309,16 +355,14 @@ async function performLogout(cookies) {
 // Keep alive function with retry-until-success logic
 async function keepAlive() {
     const startTime = Date.now();
-    
-    // Update tracking variables
     lastRunTime = new Date();
     totalRuns++;
     
     try {
-        logger.info(`🚀 Starting keep-alive cycle at ${lastRunTime.toISOString()}`);
+        logger.info(`� Starting keep-alive cycle at ${lastRunTime.toISOString()}`);
         
         if (isLoggedIn) {
-            // Perform logout
+            // Perform logout (only 2 attempts, no retry cycle)
             logger.info('🔄 Starting logout process...');
             const logoutSuccess = await performLogout(currentCookies);
             
@@ -329,34 +373,44 @@ async function keepAlive() {
                 logger.info('🔄 Logout completed successfully');
             } else {
                 failedRuns++;
-                logger.error('❌ Logout failed after multiple attempts');
+                logger.warn('Logout failed. Will proceed to login cycle.');
             }
-        } else {
-            // Perform login
-            logger.info('🔑 Starting login process...');
-            const { success, cookies, error } = await performLogin();
+        } 
+        
+        // Always try to login after logout (success or failure) or if not logged in
+        logger.info('🔑 Starting login process...');
+        const { success, cookies } = await performLogin();
+        
+        if (success) {
+            isLoggedIn = true;
+            currentCookies = cookies;
+            successfulRuns++;
+            logger.info('✅ Login completed successfully');
             
-            if (success) {
-                isLoggedIn = true;
-                currentCookies = cookies;
-                successfulRuns++;
-                logger.info('✅ Login completed successfully');
-            } else {
-                failedRuns++;
-                lastError = new Error(`Login failed: ${error || 'Unknown error'}`);
-                logger.error(`❌ Login failed after multiple attempts: ${lastError.message}`);
-            }
+            // Schedule logout after 14 minutes
+            nextRunTime = new Date(Date.now() + (14 * 60 * 1000));
+            logger.info(`⏭️ Next logout scheduled at: ${nextRunTime.toISOString()}`);
+        } else {
+            failedRuns++;
+            lastError = new Error('Login cycle failed');
+            logger.error('❌ Login cycle failed. Will retry in 1 minute.');
+            
+            // Schedule next login cycle in 1 minute
+            nextRunTime = new Date(Date.now() + (1 * 60 * 1000));
+            logger.info(`⏭️ Next login cycle at: ${nextRunTime.toISOString()}`);
         }
         
-        lastError = null;
-        
         const duration = (Date.now() - startTime) / 1000;
-        logger.info(`✅ Keep-alive cycle completed successfully in ${duration.toFixed(2)}s`);
+        logger.info(`✅ Keep-alive cycle completed in ${duration.toFixed(2)}s`);
         
     } catch (error) {
         failedRuns++;
         lastError = error;
-        logger.error(`❌ Keep-alive cycle failed: ${error.message}`);
+        logger.error(`❌ Error in keep-alive cycle: ${error.message}`);
+        
+        // On unexpected errors, retry login cycle in 1 minute
+        nextRunTime = new Date(Date.now() + (1 * 60 * 1000));
+        logger.info(`⏭️ Retrying after error at: ${nextRunTime.toISOString()}`);
     }
     
     return true;
