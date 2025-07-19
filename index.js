@@ -426,8 +426,8 @@ async function main() {
         logger.info(`🔧 Environment: ${process.env.NODE_ENV || 'development'}`);
         logger.info(`🌐 Backend URL: ${process.env.API_BASE_URL}`);
         
-        // Set the interval to 14 minutes (840000 ms)
-        const interval = 14 * 60 * 1000;
+        // Use environment variable with default of 12 minutes (720000 ms)
+        const interval = parseInt(process.env.KEEP_ALIVE_INTERVAL) || (12 * 60 * 1000);
         logger.info(`⏱  Keep-alive interval: ${interval / 60000} minutes`);
         
         // Function to run keepAlive and handle any errors
