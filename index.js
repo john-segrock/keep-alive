@@ -207,105 +207,159 @@ const api = axios.create({
     timeout: 30000 // 30 seconds timeout
 });
 
-// Keep alive function with retry mechanism
+// Function to perform login with retry logic
+async function performLogin() {
+    let attempt = 1;
+    const maxAttempts = 10; // Increased max attempts
+    const baseDelay = 5000; // 5 seconds
+    
+    while (attempt <= maxAttempts) {
+        try {
+            logger.info(`🔑 Login attempt ${attempt}/${maxAttempts}...`);
+            
+            const loginResponse = await api.post('/api/auth/login', {
+                email: process.env.KEEP_ALIVE_EMAIL,
+                password: process.env.KEEP_ALIVE_PASSWORD
+            }, {
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-Requested-With': 'XMLHttpRequest'
+                },
+                timeout: 10000
+            });
+            
+            // Get cookies from the response
+            const cookies = loginResponse.headers['set-cookie']?.join('; ');
+            
+            // Verify session
+            const meResponse = await api.get('/api/auth/me', {
+                headers: { 
+                    'Cookie': cookies,
+                    'X-Requested-With': 'XMLHttpRequest'
+                },
+                timeout: 10000
+            });
+            
+            const userEmail = meResponse.data?.email || 'N/A';
+            logger.info(`✅ Login successful for: ${userEmail}`);
+            
+            return {
+                success: true,
+                cookies
+            };
+            
+        } catch (error) {
+            const waitTime = Math.min(baseDelay * Math.pow(2, attempt - 1), 300000); // Cap at 5 minutes
+            logger.warn(`Login attempt ${attempt} failed: ${error.message}. Retrying in ${waitTime/1000} seconds...`);
+            
+            if (attempt === maxAttempts) {
+                logger.error('Max login attempts reached. Will retry on next cycle.');
+                return {
+                    success: false,
+                    error: error.message
+                };
+            }
+            
+            await new Promise(resolve => setTimeout(resolve, waitTime));
+            attempt++;
+        }
+    }
+    
+    return { success: false };
+}
+
+// Function to perform logout with retry logic
+async function performLogout(cookies) {
+    let attempt = 1;
+    const maxAttempts = 5;
+    const baseDelay = 5000; // 5 seconds
+    
+    while (attempt <= maxAttempts) {
+        try {
+            logger.info(`🚪 Logout attempt ${attempt}/${maxAttempts}...`);
+            
+            await api.post('/api/auth/logout', {}, {
+                headers: { 
+                    'Cookie': cookies,
+                    'X-Requested-With': 'XMLHttpRequest'
+                },
+                timeout: 10000
+            });
+            
+            logger.info('✅ Logout successful');
+            return true;
+            
+        } catch (error) {
+            const waitTime = Math.min(baseDelay * Math.pow(2, attempt - 1), 120000); // Cap at 2 minutes
+            logger.warn(`Logout attempt ${attempt} failed: ${error.message}. Retrying in ${waitTime/1000} seconds...`);
+            
+            if (attempt === maxAttempts) {
+                logger.error('Max logout attempts reached. Will retry on next cycle.');
+                return false;
+            }
+            
+            await new Promise(resolve => setTimeout(resolve, waitTime));
+            attempt++;
+        }
+    }
+    
+    return false;
+}
+
+// Keep alive function with retry-until-success logic
 async function keepAlive() {
     const startTime = Date.now();
-    let success = false;
-    let attempt = 1;
-    const maxAttempts = 3;
-    const baseDelay = 5000; // 5 seconds
     
     // Update tracking variables
     lastRunTime = new Date();
     totalRuns++;
     
-    while (attempt <= maxAttempts && !success) {
-        try {
-            if (attempt > 1) {
-                const delay = baseDelay * Math.pow(2, attempt - 1);
-                logger.warn(`Retry attempt ${attempt}/${maxAttempts} after ${delay}ms delay...`);
-                await new Promise(resolve => setTimeout(resolve, delay));
-            }
+    try {
+        logger.info(`🚀 Starting keep-alive cycle at ${lastRunTime.toISOString()}`);
+        
+        if (isLoggedIn) {
+            // Perform logout
+            logger.info('🔄 Starting logout process...');
+            const logoutSuccess = await performLogout(currentCookies);
             
-            logger.info(`🚀 Keep-alive attempt ${attempt}/${maxAttempts}...`);
-            
-            if (isLoggedIn) {
-                // Perform logout
-                logger.info('Performing logout...');
-                await api.post('/api/auth/logout', {}, {
-                    headers: { 
-                        'Cookie': currentCookies,
-                        'X-Requested-With': 'XMLHttpRequest'
-                    },
-                    timeout: 10000
-                });
-                logger.info('✅ Logout successful');
+            if (logoutSuccess) {
                 isLoggedIn = false;
                 currentCookies = null;
+                successfulRuns++;
+                logger.info('🔄 Logout completed successfully');
             } else {
-                // Perform login and verify session
-                logger.info('Performing login...');
-                const loginResponse = await api.post('/api/auth/login', {
-                    email: process.env.KEEP_ALIVE_EMAIL,
-                    password: process.env.KEEP_ALIVE_PASSWORD
-                }, {
-                    headers: {
-                        'Content-Type': 'application/json',
-                        'X-Requested-With': 'XMLHttpRequest'
-                    },
-                    timeout: 10000
-                });
-                
-                // Get cookies from the response
-                currentCookies = loginResponse.headers['set-cookie']?.join('; ');
-                
-                // Verify session
-                const meResponse = await api.get('/api/auth/me', {
-                    headers: { 
-                        'Cookie': currentCookies,
-                        'X-Requested-With': 'XMLHttpRequest'
-                    },
-                    timeout: 10000
-                });
-                
-                const userEmail = meResponse.data?.email || 'N/A';
-                logger.info(`✅ Login successful for: ${userEmail}`);
-                isLoggedIn = true;
-            }
-            
-            success = true;
-            successfulRuns++;
-            lastError = null;
-            
-            const duration = (Date.now() - startTime) / 1000;
-            logger.info(`✅ Keep-alive sequence completed successfully in ${duration.toFixed(2)}s`);
-            
-        } catch (error) {
-            const errorMessage = error.response?.data?.message || error.message;
-            const statusCode = error.response?.status;
-            lastError = error;
-            
-            logger.error(`❌ Attempt ${attempt} failed: ${errorMessage} ${statusCode ? `(Status: ${statusCode})` : ''}`);
-            
-            if (attempt === maxAttempts) {
                 failedRuns++;
-                logger.error(`❌ All ${maxAttempts} attempts failed. Will retry on next interval.`);
+                logger.error('❌ Logout failed after multiple attempts');
             }
+        } else {
+            // Perform login
+            logger.info('🔑 Starting login process...');
+            const { success, cookies, error } = await performLogin();
             
-            // Log full error in debug mode or on last attempt
-            if (process.env.LOG_LEVEL === 'debug' || attempt === maxAttempts) {
-                logger.debug('Error details:', {
-                    message: error.message,
-                    stack: error.stack,
-                    response: error.response?.data
-                });
+            if (success) {
+                isLoggedIn = true;
+                currentCookies = cookies;
+                successfulRuns++;
+                logger.info('✅ Login completed successfully');
+            } else {
+                failedRuns++;
+                lastError = new Error(`Login failed: ${error || 'Unknown error'}`);
+                logger.error(`❌ Login failed after multiple attempts: ${lastError.message}`);
             }
-            
-            attempt++;
         }
+        
+        lastError = null;
+        
+        const duration = (Date.now() - startTime) / 1000;
+        logger.info(`✅ Keep-alive cycle completed successfully in ${duration.toFixed(2)}s`);
+        
+    } catch (error) {
+        failedRuns++;
+        lastError = error;
+        logger.error(`❌ Keep-alive cycle failed: ${error.message}`);
     }
     
-    return success;
+    return true;
 }
 
 // Main function
@@ -326,7 +380,6 @@ async function main() {
         const runKeepAlive = async () => {
             try {
                 await keepAlive();
-                successfulRuns++;
             } catch (error) {
                 failedRuns++;
                 lastError = error;
