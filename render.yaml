@@ -16,7 +16,19 @@ services:
       - key: KEEP_ALIVE_PASSWORD
         value: your-secure-password
       - key: KEEP_ALIVE_INTERVAL
-        value: '840000'  # 14 minutes in milliseconds
+        value: '720000'  # 12 minutes in milliseconds (override in .env for testing)
       - key: LOG_LEVEL
         value: 'info'
+      - key: ALERT_EMAIL
+        value: ''
+      - key: SMTP_HOST
+        value: ''
+      - key: SMTP_PORT
+        value: '587'
+      - key: SMTP_USER
+        value: ''
+      - key: SMTP_PASS
+        value: ''
+      - key: SMTP_FROM
+        value: ''
     plan: free

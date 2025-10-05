@@ -1,113 +1,45 @@
-# Keep-Alive Service - Firebase Deployment Guide
+# Keep-Alive Service - Deployment Guide
 
-This guide will walk you through deploying the Keep-Alive Service to Firebase Functions.
+This guide explains how to run the Keep-Alive Service as a standalone Node.js application or inside a container.
 
 ## Prerequisites
 
-1. Install Node.js (v18 or later)
-2. Install Firebase CLI:
-   ```bash
-   npm install -g firebase-tools
-   ```
-3. Log in to Firebase:
-   ```bash
-   firebase login
+1. Install Node.js (v16 or later)
+2. Install dependencies:
+   ```powershell
+   cd functions
+   npm install
    ```
 
-## Deployment Steps
+## Running locally
 
-### 1. Initialize Firebase Project
+1. Build the TypeScript code:
+   ```powershell
+   cd functions
+   npm run build
+   ```
+2. Start the service (from project root):
+   ```powershell
+   node index.js
+   ```
 
-```bash
-# Navigate to the project root
-cd keep-alive-service
+The service exposes a health endpoint at `http://localhost:3000/health` (or the port set in `PORT`).
 
-# Initialize Firebase (select Functions and Hosting when prompted)
-firebase init
+## Environment variables
 
-# During initialization:
-# - Select "Functions" and "Hosting"
-# - Choose "Use an existing project" or create a new one
-# - Select TypeScript when asked
-# - Answer "No" to ESLint and install dependencies
-```
+The service requires the following environment variables to be set (for HTTP/scheduled mode):
 
-### 2. Set Up Environment Variables
+- `API_BASE_URL` (required)
+- `API_USERNAME` or `KEEP_ALIVE_EMAIL` (depending on which entrypoint you use)
+- `API_PASSWORD` or `KEEP_ALIVE_PASSWORD`
+- `KEEP_ALIVE_INTERVAL` (optional, milliseconds; default ~12 minutes)
+- `PORT` (optional, for HTTP server)
 
-Set the required environment variables in Firebase:
+## Docker / Container
 
-```bash
-firebase functions:config:set \
-  keepalive.api_base_url="YOUR_API_BASE_URL" \
-  keepalive.api_username="YOUR_USERNAME" \
-  keepalive.api_password="YOUR_PASSWORD" \
-  keepalive.keep_alive_interval="720000" \
-  keepalive.log_level="info"
-```
+Build and run with your preferred container tooling. Ensure env vars are provided to the container at runtime.
 
-### 3. Deploy to Firebase
+## Notes
 
-```bash
-# Navigate to the functions directory
-cd functions
-
-# Install dependencies
-npm install
-
-# Build the TypeScript code
-npm run build
-
-# Deploy to Firebase
-firebase deploy --only functions
-```
-
-### 4. Verify Deployment
-
-After deployment, you'll receive URLs for your functions. Test them:
-
-1. **Health Check**: `https://[YOUR-PROJECT-REGION]-[YOUR-PROJECT-ID].cloudfunctions.net/healthCheck`
-2. **Manual Trigger**: `https://[YOUR-PROJECT-REGION]-[YOUR-PROJECT-ID].cloudfunctions.net/keepAliveHttp`
-
-The scheduled function will run automatically based on the schedule (default: every 12 minutes).
-
-## Available Functions
-
-- `scheduledKeepAlive`: Runs on a schedule (default: every 12 minutes)
-- `keepAliveHttp`: Can be triggered manually via HTTP
-- `healthCheck`: Returns the service status and metrics
-
-## Monitoring and Logs
-
-View logs in the Firebase Console:
-
-```bash
-firebase functions:log
-```
-
-Or in the [Firebase Console](https://console.firebase.google.com/) under "Functions" > "Logs".
-
-## Updating Environment Variables
-
-To update environment variables:
-
-```bash
-firebase functions:config:set keepalive.api_username="new_username"
-firebase deploy --only functions
-```
-
-## Troubleshooting
-
-- **Cold Starts**: The first request after deployment might be slow due to cold starts
-- **Timeouts**: Default timeout is 60 seconds. Adjust in `firebase.json` if needed
-- **Authentication Issues**: Double-check your API credentials and base URL
-
-## Costs
-
-- Firebase Functions has a generous free tier (2 million invocations/month)
-- Monitor usage in the [Firebase Console](https://console.firebase.google.com/)
-
-## Security Notes
-
-- Never commit sensitive information to version control
-- Use Firebase's built-in secret management for sensitive data
-- Review and set appropriate Firebase Security Rules
+- The project no longer depends on Firebase; it runs as a standalone service or inside a container.
+- Keep secrets out of version control. Use your platform's secret manager for production.

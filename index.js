@@ -3,13 +3,14 @@ import axios from 'axios';
 import winston from 'winston';
 import winstonDailyRotate from 'winston-daily-rotate-file';
 import express from 'express';
+import nodemailer from 'nodemailer';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import os from 'os';
 
-// Configure environment variables
-dotenv.config();
+// Configure environment variables (force .env to override system env when present)
+dotenv.config({ override: true });
 
 // Get the current directory name in ES module
 const __filename = fileURLToPath(import.meta.url);
@@ -241,6 +242,12 @@ let failedRuns = 0;
 let lastError = null;
 let isLoggedIn = false; // Track login state to alternate between login/logout
 let currentCookies = null; // Store cookies for logout
+// nextAction toggles between 'login' and 'logout' to keep equal spacing
+let nextAction = 'login';
+let isKeepAliveRunning = false; // prevent overlapping runs
+let lastAlertSentAt = null; // timestamp of last alert email sent
+const alertCooldownMs = Number(process.env.ALERT_COOLDOWN_MS) || (60 * 1000);
+let alertSuppressed = false; // when true, don't send additional alert emails until a success clears it
 
 // Validate environment variables
 function validateEnv() {
@@ -268,6 +275,57 @@ const api = axios.create({
     timeout: 30000 // 30 seconds timeout
 });
 
+// Configure email transporter if SMTP settings provided
+let mailerTransport = null;
+function configureMailer() {
+    const host = process.env.SMTP_HOST;
+    const port = process.env.SMTP_PORT ? Number(process.env.SMTP_PORT) : undefined;
+    const user = process.env.SMTP_USER;
+    const pass = process.env.SMTP_PASS;
+
+    if (host && port && user && pass) {
+        mailerTransport = nodemailer.createTransport({
+            host,
+            port,
+            secure: port === 465, // true for 465, false for other ports
+            auth: {
+                user,
+                pass
+            }
+        });
+        logger.info('✉️ Mailer configured');
+    } else {
+        logger.info('✉️ Mailer not configured - set SMTP_HOST/PORT/USER/PASS to enable alerts');
+    }
+}
+
+async function sendAlertEmail(subject, text) {
+    if (!mailerTransport) {
+        logger.warn('✉️ Mailer not configured, cannot send alert email');
+        return false;
+    }
+
+    const to = process.env.ALERT_EMAIL;
+    if (!to) {
+        logger.warn('✉️ ALERT_EMAIL not set; skipping alert');
+        return false;
+    }
+
+    try {
+        await mailerTransport.sendMail({
+            from: process.env.SMTP_FROM || process.env.SMTP_USER,
+            to,
+            subject,
+            text
+        });
+        logger.info(`✉️ Alert email sent to ${to}`);
+        return true;
+    } catch (err) {
+        logger.error('✉️ Failed to send alert email:', err);
+        return false;
+    }
+}
+
 // Function to perform login with retry logic
 async function performLogin() {
     let attempt = 1;
@@ -276,7 +334,7 @@ async function performLogin() {
     
     while (attempt <= maxAttempts) {
         try {
-            logger.info(`🔑 Login attempt ${attempt}/${maxAttempts}...`);
+    logger.debug(`Login attempt ${attempt}/${maxAttempts}`);
             
             const loginResponse = await api.post('/api/auth/login', {
                 email: process.env.KEEP_ALIVE_EMAIL,
@@ -291,7 +349,8 @@ async function performLogin() {
             
             const cookies = loginResponse.headers['set-cookie']?.join('; ');
             const userEmail = loginResponse.data?.email || 'N/A';
-            logger.info(`✅ Login successful for: ${userEmail}`);
+            // internal success logged at debug level to avoid duplication with user-facing info logs
+            logger.debug(`✅ Login successful (internal)${userEmail && userEmail !== 'N/A' ? ` for: ${userEmail}` : ''}`);
             
             return {
                 success: true,
@@ -303,7 +362,58 @@ async function performLogin() {
             logger.warn(`Login attempt ${attempt} failed: ${error.message}`);
             
             if (attempt === maxAttempts) {
-                logger.error('Max login attempts reached. Will retry login cycle in 1 minute.');
+                const retryDelayMs = 60 * 1000; // 1 minute
+                // set nextRunTime so health endpoint and logs reflect when we'll retry
+                nextRunTime = new Date(Date.now() + retryDelayMs);
+                const msg = `❌ Max login attempts reached; will retry in ${Math.round(retryDelayMs/1000)}s (nextRun=${nextRunTime.toISOString()})`;
+                logger.error(msg);
+
+                // Throttle alerts using cooldown and only send if not already suppressed
+                const now = Date.now();
+                if (!alertSuppressed && (!lastAlertSentAt || (now - lastAlertSentAt) > alertCooldownMs)) {
+                    lastAlertSentAt = now;
+                    alertSuppressed = true; // suppress further alerts until a success clears it
+                    sendAlertEmail('Keep-alive service: max login attempts reached', `The keep-alive service failed to login ${maxAttempts} times. Backend: ${process.env.API_BASE_URL}. Time: ${new Date().toISOString()}`)
+                        .then(sent => {
+                            if (sent) {
+                                logger.info(`✉️ Alert email sent to ${process.env.ALERT_EMAIL}`);
+                            }
+                        })
+                        .catch(e => logger.error('Error sending alert email', e));
+                } else {
+                    logger.info('✉️ Alert suppressed (already sent or in cooldown)');
+                }
+
+                // Immediately attempt a fresh follow-up batch of maxAttempts to continue the cycle
+                logger.info('🔁 Starting follow-up login batch after alert to continue attempts');
+                for (let follow = 1; follow <= maxAttempts; follow++) {
+                    try {
+                        logger.debug(`Follow-up login attempt ${follow}/${maxAttempts}`);
+                        const followResp = await api.post('/api/auth/login', {
+                            email: process.env.KEEP_ALIVE_EMAIL,
+                            password: process.env.KEEP_ALIVE_PASSWORD
+                        }, {
+                            headers: {
+                                'Content-Type': 'application/json',
+                                'X-Requested-With': 'XMLHttpRequest'
+                            },
+                            timeout: 10000
+                        });
+
+                        const cookies = followResp.headers['set-cookie']?.join('; ');
+                        const userEmail = followResp.data?.email || 'N/A';
+                        logger.debug(`✅ Follow-up login successful (internal)${userEmail && userEmail !== 'N/A' ? ` for: ${userEmail}` : ''}`);
+                        // clear suppression on success
+                        alertSuppressed = false;
+                        return { success: true, cookies };
+                    } catch (e) {
+                        logger.warn(`Follow-up login attempt ${follow} failed: ${e.message}`);
+                        // small delay between follow-up attempts
+                        await new Promise(r => setTimeout(r, Math.min(baseDelay * Math.pow(2, follow - 1), 30000)));
+                    }
+                }
+
+                // if follow-up also failed, return failure
                 return { success: false };
             }
             
@@ -323,7 +433,7 @@ async function performLogout(cookies) {
     
     while (attempt <= maxAttempts) {
         try {
-            logger.info(`🚪 Logout attempt ${attempt}/${maxAttempts}...`);
+            logger.debug(`Logout attempt ${attempt}/${maxAttempts}`);
             
             await api.post('/api/auth/logout', {}, {
                 headers: { 
@@ -333,7 +443,8 @@ async function performLogout(cookies) {
                 timeout: 10000
             });
             
-            logger.info('✅ Logout successful');
+            // internal success logged at debug level to avoid duplication with user-facing info logs
+            logger.debug('✅ Logout successful (internal)');
             return true;
             
         } catch (error) {
@@ -359,49 +470,47 @@ async function keepAlive() {
     totalRuns++;
     
     try {
-        logger.info(`� Starting keep-alive cycle at ${lastRunTime.toISOString()}`);
-        
-        if (isLoggedIn) {
-            // Perform logout (only 2 attempts, no retry cycle)
-            logger.info('🔄 Starting logout process...');
+        logger.info(`Keep-alive cycle start: action=${nextAction}`);
+
+        if (nextAction === 'logout') {
+            // attempt logout
+            logger.info('🚪 Attempting logout');
             const logoutSuccess = await performLogout(currentCookies);
-            
+
             if (logoutSuccess) {
                 isLoggedIn = false;
                 currentCookies = null;
                 successfulRuns++;
-                logger.info('🔄 Logout completed successfully');
+                logger.info('✅ Logout completed');
             } else {
                 failedRuns++;
-                logger.warn('Logout failed. Will proceed to login cycle.');
+                logger.warn('❌ Logout failed');
             }
-        } 
-        
-        // Always try to login after logout (success or failure) or if not logged in
-        logger.info('🔑 Starting login process...');
-        const { success, cookies } = await performLogin();
-        
-        if (success) {
-            isLoggedIn = true;
-            currentCookies = cookies;
-            successfulRuns++;
-            logger.info('✅ Login completed successfully');
-            
-            // Schedule logout after 14 minutes
-            nextRunTime = new Date(Date.now() + (14 * 60 * 1000));
-            logger.info(`⏭️ Next logout scheduled at: ${nextRunTime.toISOString()}`);
+
+            // toggle for next run
+            nextAction = 'login';
         } else {
-            failedRuns++;
-            lastError = new Error('Login cycle failed');
-            logger.error('❌ Login cycle failed. Will retry in 1 minute.');
-            
-            // Schedule next login cycle in 1 minute
-            nextRunTime = new Date(Date.now() + (1 * 60 * 1000));
-            logger.info(`⏭️ Next login cycle at: ${nextRunTime.toISOString()}`);
+            // attempt login
+            logger.info('🔑 Attempting login');
+            const { success, cookies } = await performLogin();
+
+            if (success) {
+                isLoggedIn = true;
+                currentCookies = cookies;
+                successfulRuns++;
+                logger.info('✅ Login completed');
+            } else {
+                failedRuns++;
+                lastError = new Error('Login failed');
+                logger.warn('❌ Login failed');
+            }
+
+            // toggle for next run
+            nextAction = 'logout';
         }
         
-        const duration = (Date.now() - startTime) / 1000;
-        logger.info(`✅ Keep-alive cycle completed in ${duration.toFixed(2)}s`);
+    const duration = (Date.now() - startTime) / 1000;
+    logger.info(`⏭️ Keep-alive completed: duration=${duration.toFixed(2)}s — next=${nextAction}`);
         
     } catch (error) {
         failedRuns++;
@@ -421,17 +530,24 @@ async function main() {
     try {
         // Validate environment variables
         validateEnv();
+
+    // Configure mailer transport (if SMTP vars are present)
+    configureMailer();
         
-        logger.info('🚀 Starting keep-alive service...');
-        logger.info(`🔧 Environment: ${process.env.NODE_ENV || 'development'}`);
-        logger.info(`🌐 Backend URL: ${process.env.API_BASE_URL}`);
-        
-        // Use environment variable with default of 12 minutes (720000 ms)
-        const interval = parseInt(process.env.KEEP_ALIVE_INTERVAL) || (12 * 60 * 1000);
-        logger.info(`⏱  Keep-alive interval: ${interval / 60000} minutes`);
+    // Use environment variable with default of 12 minutes (720000 ms)
+    // Accept raw numbers (milliseconds) and ignore inline comments after a '#'
+    const rawEnvValue = (process.env.KEEP_ALIVE_INTERVAL || '').toString();
+    const rawInterval = rawEnvValue.split('#')[0].trim().split(/\s+/)[0];
+    const parsed = Number(rawInterval);
+    const interval = Number.isFinite(parsed) && parsed > 0 ? parsed : (12 * 60 * 1000);
         
         // Function to run keepAlive and handle any errors
         const runKeepAlive = async () => {
+            if (isKeepAliveRunning) {
+                logger.debug('⏱ Previous keep-alive run still executing; skipping this interval');
+                return;
+            }
+            isKeepAliveRunning = true;
             try {
                 await keepAlive();
             } catch (error) {
@@ -439,15 +555,12 @@ async function main() {
                 lastError = error;
                 logger.error('Error in keep-alive:', error);
             } finally {
+                isKeepAliveRunning = false;
                 lastRunTime = new Date();
                 nextRunTime = new Date(Date.now() + interval);
                 logger.info(`⏭️ Next run at: ${nextRunTime.toLocaleTimeString()}`);
             }
         };
-        
-        // Initial run (will perform login on first run)
-        logger.info('Running initial keep-alive check...');
-        await runKeepAlive();
         
         // Set up interval for subsequent runs
         const intervalId = setInterval(runKeepAlive, interval);
@@ -498,10 +611,6 @@ async function main() {
             logger.error('Unhandled Rejection at:', promise, 'reason:', reason);
             // Don't exit for unhandled rejections to keep the process running
         });
-
-        // Log startup completion
-        logger.info('✅ Service is running and ready');
-        logger.info(`🌐 Health check available at http://localhost:${PORT}/health`);
         
     } catch (error) {
         logger.error('Fatal error during service startup:', error);

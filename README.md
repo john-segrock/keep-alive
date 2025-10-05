@@ -1,129 +1,95 @@
 # Keep-Alive Service
 
-A Node.js service that keeps your backend alive by making periodic authenticated requests.
+This repository contains a small Node.js service that keeps a remote backend active by periodically performing authenticated requests. The service includes logging, retries, and a small HTTP health endpoint so you can monitor status.
 
-## Features
+This project was previously organized as a Firebase Functions subproject; it has been consolidated into a single runnable application at the repository root.
 
-- Runs continuously in the background
-- Makes authenticated requests to your backend
-- Logs all activities to console and files
-- Handles errors gracefully
-- Easy to deploy
+Contents
+- `index.js` — main service and HTTP/health server
+- `package.json` — root package manifest (dependencies & scripts)
+- `DEPLOYMENT.md` — how to run/deploy
 
-## Prerequisites
+What the application does (step-by-step)
+1. Startup
+   - `index.js` reads environment variables (via `dotenv` if present).
+   - Logger is configured (Console + daily rotate files).
+   - The HTTP server (Express) is started on `PORT` (default 3000).
 
-- Node.js 16.x or higher
-- npm or yarn
+2. Initial keep-alive cycle
+   - On startup the service immediately runs one keep-alive cycle.
+   - A keep-alive cycle does:
+     a. If not currently authenticated, perform login by POSTing to `API_BASE_URL/api/auth/login` with credentials.
+     b. On successful login, store cookies for authenticated requests.
+     c. Perform an authenticated GET to `API_BASE_URL/api/user/me` (or equivalent) to verify the session.
+     d. If successful, mark the run as successful; on error it increments failure counters and triggers re-login when necessary.
 
-## Installation
+3. Recurring runs
+   - The keep-alive cycle is scheduled with a configurable interval: `KEEP_ALIVE_INTERVAL` (milliseconds). Default is ~12 minutes.
+   - Each run logs duration, success/failure, and updates `lastRunTime` / `nextRunTime` state.
 
-1. Clone this repository
-2. Install dependencies:
-   ```bash
-   npm install
-   ```
-3. Copy `.env.example` to `.env` and update the values:
-   ```bash
-   cp .env.example .env
-   ```
+4. Manual triggering & health
+   - The app exposes a health endpoint at `/health` that returns:
+     - service status, uptime, memory usage
+     - last run time, next run time, failed run count, last error
+   - There is also a simple root `GET /` and `GET /ping` endpoints.
 
-## Configuration
+5. Shutdown handling
+   - On SIGINT/SIGTERM the app will attempt a graceful shutdown and attempt a final logout if logged in.
 
-Edit the `.env` file with your backend details:
+Environment variables (important)
+- `API_BASE_URL` (required) — base URL of the backend to ping
+- `API_USERNAME` / `KEEP_ALIVE_EMAIL` (required) — username/email for login
+- `API_PASSWORD` / `KEEP_ALIVE_PASSWORD` (required) — password for login
+- `KEEP_ALIVE_INTERVAL` (optional) — milliseconds between runs (default ~12 minutes)
+- `PORT` (optional) — port for the health/HTTP server (default: 3000)
+- `LOG_LEVEL` (optional) — winston log level (info, debug, etc.)
+ - `ALERT_EMAIL` (optional) — recipient email to notify when max login attempts are reached
+ - `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASS` (optional) — SMTP server credentials used to send alert emails
+ - `SMTP_FROM` (optional) — optional from address for alert emails (defaults to SMTP_USER)
+ - `ALERT_COOLDOWN_MS` (optional) — minimum milliseconds between alert emails (default: 60000 = 1 minute)
 
+Behavior notes:
+- When the service fails to login after `maxAttempts` (default 10), it will send a single alert email (if configured).
+- To avoid email storms, alerts are throttled by `ALERT_COOLDOWN_MS`. The service will still continue attempting login cycles after alerting.
+
+How the authentication & request flow works
+- Login: POST to `${API_BASE_URL}/api/auth/login` with { username/password }.
+- The server should return a successful response and set a session cookie via `Set-Cookie`.
+- The service stores the cookie string and sends it with subsequent requests.
+- Requests: GET `${API_BASE_URL}/api/user/me` to validate the session.
+- Logout: POST to `${API_BASE_URL}/api/auth/logout` when requested (or before shutdown).
+
+Running the service locally
+1. Install dependencies:
+```powershell
+npm install
+```
+2. Create a `.env` file (or set env vars directly):
 ```env
-# Your backend base URL (without trailing slash)
-API_BASE_URL=http://your-backend-url.com
-
-# Login credentials for the keep-alive service
-KEEP_ALIVE_EMAIL=your-email@example.com
-KEEP_ALIVE_PASSWORD=your-secure-password
-
-# How often to ping the server (in milliseconds)
-KEEP_ALIVE_INTERVAL=840000  # 14 minutes
-
-# Log level (error, warn, info, debug)
+API_BASE_URL=https://your-backend.example.com
+API_USERNAME=your_user
+API_PASSWORD=your_password
+KEEP_ALIVE_INTERVAL=720000
+PORT=3000
 LOG_LEVEL=info
 ```
-
-## Running the Service
-
-### Development Mode
-
-```bash
+3. Run (development):
+```powershell
 npm run dev
 ```
-
-### Production Mode
-
-```bash
+4. Run (production):
+```powershell
 npm start
 ```
 
-### Running in Background (Linux/macOS)
+Quick test
+- After starting, visit `http://localhost:3000/health` to verify the service is UP and to inspect run statistics.
 
-```bash
-nohup node index.js > logs/keep-alive.log 2>&1 &
+Cleaning and maintenance
+- To prune and refresh installed packages:
+```powershell
+Remove-Item -Recurse -Force node_modules
+npm install
 ```
 
-### Running as a Windows Service
-
-1. Install `node-windows` globally:
-   ```bash
-   npm install -g node-windows
-   ```
-2. Create a `service.js` file with the following content:
-   ```javascript
-   const Service = require('node-windows').Service;
-   const path = require('path');
-
-   const svc = new Service({
-     name: 'KeepAliveService',
-     description: 'Keeps the backend service alive',
-     script: path.join(__dirname, 'index.js'),
-     nodeOptions: [
-       '--harmony',
-       '--max_old_space_size=4096'
-     ]
-   });
-
-   svc.on('install', () => {
-     console.log('Service installed');
-     svc.start();
-   });
-
-   svc.install();
-   ```
-3. Run the service installer:
-   ```bash
-   node service.js
-   ```
-
-## Logs
-
-Logs are stored in the `logs` directory:
-- `combined.log` - All logs
-- `error.log` - Error logs only
-
-## Monitoring
-
-You can monitor the service by checking the logs or by setting up a monitoring solution like PM2:
-
-```bash
-# Install PM2 globally
-npm install -g pm2
-
-# Start the service with PM2
-pm2 start index.js --name "keep-alive-service"
-
-# Monitor logs
-pm2 logs keep-alive-service
-
-# Save process list for auto-restart on reboot
-pm2 save
-pm2 startup
-```
-
-## License
-
-MIT
+License: MIT
