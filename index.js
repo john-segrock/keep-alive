@@ -313,6 +313,16 @@ function configureMailer() {
     }
 }
 
+// --- Safe debug: log presence (true/false) of SMTP-related env vars at startup
+// This helps confirm which variables the running process actually sees on the
+// hosting platform (e.g. Render) without exposing secrets in logs.
+function logEnvPresence() {
+    const envVars = ['ALERT_EMAIL', 'SMTP_HOST', 'SMTP_PORT', 'SMTP_USER', 'SMTP_PASS', 'SMTP_FROM'];
+    const presence = {};
+    envVars.forEach(k => presence[k] = !!process.env[k]);
+    logger.info('🔍 Env presence', presence);
+}
+
 async function sendAlertEmail(subject, text) {
     if (!mailerTransport) {
         logger.warn('✉️ Mailer not configured, cannot send alert email');
@@ -546,6 +556,8 @@ async function main() {
         validateEnv();
 
     // Configure mailer transport (if SMTP vars are present)
+    // Log presence of SMTP/alert env vars (safe booleans) for troubleshooting
+    logEnvPresence();
     configureMailer();
         
     // Use environment variable with default of 12 minutes (720000 ms)
