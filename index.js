@@ -9,8 +9,11 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import os from 'os';
 
-// Configure environment variables (force .env to override system env when present)
-dotenv.config({ override: true });
+// Configure environment variables. Do NOT force .env to override system
+// environment variables provided by the hosting platform (e.g. Render).
+// This makes dashboard/host-provided values take precedence over any
+// `.env` file checked into the repository.
+dotenv.config();
 
 // Get the current directory name in ES module
 const __filename = fileURLToPath(import.meta.url);
@@ -295,7 +298,18 @@ function configureMailer() {
         });
         logger.info('✉️ Mailer configured');
     } else {
-        logger.info('✉️ Mailer not configured - set SMTP_HOST/PORT/USER/PASS to enable alerts');
+        // Only log that mailer is not configured when user intended to receive alerts
+        // (i.e. ALERT_EMAIL is set). This avoids noisy startup logs when secrets
+        // are intentionally configured in the Render dashboard or omitted from the
+        // repo's `render.yaml` file. Note: Render's environment settings in the
+        // dashboard override values in the `render.yaml` file; leaving an empty
+        // key in `render.yaml` can effectively unset a dashboard value.
+        if (process.env.ALERT_EMAIL) {
+            logger.info('✉️ Mailer not configured - ALERT_EMAIL set but SMTP_HOST/PORT/USER/PASS are missing or empty; set them to enable alerts');
+        } else {
+            // Mailer intentionally disabled (no ALERT_EMAIL); keep quiet.
+            logger.debug('✉️ Mailer disabled (no ALERT_EMAIL set)');
+        }
     }
 }
 
